@@ -20,6 +20,7 @@ import datetime
 import sys
 import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.utils as utils
@@ -321,6 +322,7 @@ def online_eval(model, dataloader_eval, gpu, ngpus):
 
 def main_worker(gpu, ngpus_per_node, args):
     args.gpu = gpu
+    torch.cuda.set_device(1)
 
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
@@ -354,7 +356,7 @@ def main_worker(gpu, ngpus_per_node, args):
             model.cuda()
             model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
     else:
-        model = torch.nn.DataParallel(model)
+        model = torch.nn.DataParallel(model, device_ids=[args.gpu])
         model.cuda()
 
     if args.distributed:
@@ -402,17 +404,17 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     dataloader = BtsDataLoader(args, 'train')
-    dataloader_eval = BtsDataLoader(args, 'online_eval')
+    # dataloader_eval = BtsDataLoader(args, 'online_eval')
 
     # Logging
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
         writer = SummaryWriter(args.log_directory + '/' + args.model_name + '/summaries', flush_secs=30)
-        if args.do_online_eval:
-            if args.eval_summary_directory != '':
-                eval_summary_path = os.path.join(args.eval_summary_directory, args.model_name)
-            else:
-                eval_summary_path = os.path.join(args.log_directory, 'eval')
-            eval_summary_writer = SummaryWriter(eval_summary_path, flush_secs=30)
+        # if args.do_online_eval:
+        #     if args.eval_summary_directory != '':
+        #         eval_summary_path = os.path.join(args.eval_summary_directory, args.model_name)
+        #     else:
+        #         eval_summary_path = os.path.join(args.log_directory, 'eval')
+        #     eval_summary_writer = SummaryWriter(eval_summary_path, flush_secs=30)
 
     silog_criterion = silog_loss(variance_focus=args.variance_focus)
 
@@ -445,13 +447,18 @@ def main_worker(gpu, ngpus_per_node, args):
             depth_gt = torch.autograd.Variable(sample_batched['depth'].cuda(args.gpu, non_blocking=True))
 
             lpg8x8, lpg4x4, lpg2x2, reduc1x1, depth_est = model(image, focal)
+            gt_avg = torch.mean(depth_gt)
+            gt_std = torch.std(depth_gt)
+            est_avg = torch.mean(depth_est)
+            est_std = torch.std(depth_est)
+            depth_est_aligned = (depth_gt - gt_avg) * est_std / gt_std + est_avg
+            depth_est_aligned = torch.where(depth_est_aligned > 1.0, depth_est_aligned, torch.autograd.Variable(torch.tensor(1.0).cuda(args.gpu)))
 
             if args.dataset == 'nyu':
                 mask = depth_gt > 0.1
             else:
                 mask = depth_gt > 1.0
-
-            loss = silog_criterion.forward(depth_est, depth_gt, mask.to(torch.bool))
+            loss = silog_criterion.forward(depth_est_aligned, depth_gt, mask.to(torch.bool))
             loss.backward()
             for param_group in optimizer.param_groups:
                 current_lr = (args.learning_rate - end_learning_rate) * (1 - global_step / num_total_steps) ** 0.9 + end_learning_rate
@@ -488,10 +495,10 @@ def main_worker(gpu, ngpus_per_node, args):
                     for i in range(num_log_images):
                         writer.add_image('depth_gt/image/{}'.format(i), normalize_result(1/depth_gt[i, :, :, :].data), global_step)
                         writer.add_image('depth_est/image/{}'.format(i), normalize_result(1/depth_est[i, :, :, :].data), global_step)
-                        writer.add_image('reduc1x1/image/{}'.format(i), normalize_result(1/reduc1x1[i, :, :, :].data), global_step)
-                        writer.add_image('lpg2x2/image/{}'.format(i), normalize_result(1/lpg2x2[i, :, :, :].data), global_step)
-                        writer.add_image('lpg4x4/image/{}'.format(i), normalize_result(1/lpg4x4[i, :, :, :].data), global_step)
-                        writer.add_image('lpg8x8/image/{}'.format(i), normalize_result(1/lpg8x8[i, :, :, :].data), global_step)
+                        # writer.add_image('reduc1x1/image/{}'.format(i), normalize_result(1/reduc1x1[i, :, :, :].data), global_step)
+                        # writer.add_image('lpg2x2/image/{}'.format(i), normalize_result(1/lpg2x2[i, :, :, :].data), global_step)
+                        # writer.add_image('lpg4x4/image/{}'.format(i), normalize_result(1/lpg4x4[i, :, :, :].data), global_step)
+                        # writer.add_image('lpg8x8/image/{}'.format(i), normalize_result(1/lpg8x8[i, :, :, :].data), global_step)
                         writer.add_image('image/image/{}'.format(i), inv_normalize(image[i, :, :, :]).data, global_step)
                     writer.flush()
 
@@ -502,46 +509,46 @@ def main_worker(gpu, ngpus_per_node, args):
                                   'optimizer': optimizer.state_dict()}
                     torch.save(checkpoint, args.log_directory + '/' + args.model_name + '/model-{}'.format(global_step))
 
-            if args.do_online_eval and global_step and global_step % args.eval_freq == 0 and not model_just_loaded:
-                time.sleep(0.1)
-                model.eval()
-                eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node)
-                if eval_measures is not None:
-                    for i in range(9):
-                        eval_summary_writer.add_scalar(eval_metrics[i], eval_measures[i].cpu(), int(global_step))
-                        measure = eval_measures[i]
-                        is_best = False
-                        if i < 6 and measure < best_eval_measures_lower_better[i]:
-                            old_best = best_eval_measures_lower_better[i].item()
-                            best_eval_measures_lower_better[i] = measure.item()
-                            is_best = True
-                        elif i >= 6 and measure > best_eval_measures_higher_better[i-6]:
-                            old_best = best_eval_measures_higher_better[i-6].item()
-                            best_eval_measures_higher_better[i-6] = measure.item()
-                            is_best = True
-                        if is_best:
-                            old_best_step = best_eval_steps[i]
-                            old_best_name = '/model-{}-best_{}_{:.5f}'.format(old_best_step, eval_metrics[i], old_best)
-                            model_path = args.log_directory + '/' + args.model_name + old_best_name
-                            if os.path.exists(model_path):
-                                command = 'rm {}'.format(model_path)
-                                os.system(command)
-                            best_eval_steps[i] = global_step
-                            model_save_name = '/model-{}-best_{}_{:.5f}'.format(global_step, eval_metrics[i], measure)
-                            print('New best for {}. Saving model: {}'.format(eval_metrics[i], model_save_name))
-                            checkpoint = {'global_step': global_step,
-                                          'model': model.state_dict(),
-                                          'optimizer': optimizer.state_dict(),
-                                          'best_eval_measures_higher_better': best_eval_measures_higher_better,
-                                          'best_eval_measures_lower_better': best_eval_measures_lower_better,
-                                          'best_eval_steps': best_eval_steps
-                                          }
-                            torch.save(checkpoint, args.log_directory + '/' + args.model_name + model_save_name)
-                    eval_summary_writer.flush()
-                model.train()
-                block_print()
-                set_misc(model)
-                enable_print()
+            # if args.do_online_eval and global_step and global_step % args.eval_freq == 0 and not model_just_loaded:
+            #     time.sleep(0.1)
+            #     model.eval()
+            #     eval_measures = online_eval(model, dataloader_eval, gpu, ngpus_per_node)
+            #     if eval_measures is not None:
+            #         for i in range(9):
+            #             eval_summary_writer.add_scalar(eval_metrics[i], eval_measures[i].cpu(), int(global_step))
+            #             measure = eval_measures[i]
+            #             is_best = False
+            #             if i < 6 and measure < best_eval_measures_lower_better[i]:
+            #                 old_best = best_eval_measures_lower_better[i].item()
+            #                 best_eval_measures_lower_better[i] = measure.item()
+            #                 is_best = True
+            #             elif i >= 6 and measure > best_eval_measures_higher_better[i-6]:
+            #                 old_best = best_eval_measures_higher_better[i-6].item()
+            #                 best_eval_measures_higher_better[i-6] = measure.item()
+            #                 is_best = True
+            #             if is_best:
+            #                 old_best_step = best_eval_steps[i]
+            #                 old_best_name = '/model-{}-best_{}_{:.5f}'.format(old_best_step, eval_metrics[i], old_best)
+            #                 model_path = args.log_directory + '/' + args.model_name + old_best_name
+            #                 if os.path.exists(model_path):
+            #                     command = 'rm {}'.format(model_path)
+            #                     os.system(command)
+            #                 best_eval_steps[i] = global_step
+            #                 model_save_name = '/model-{}-best_{}_{:.5f}'.format(global_step, eval_metrics[i], measure)
+            #                 print('New best for {}. Saving model: {}'.format(eval_metrics[i], model_save_name))
+            #                 checkpoint = {'global_step': global_step,
+            #                               'model': model.state_dict(),
+            #                               'optimizer': optimizer.state_dict(),
+            #                               'best_eval_measures_higher_better': best_eval_measures_higher_better,
+            #                               'best_eval_measures_lower_better': best_eval_measures_lower_better,
+            #                               'best_eval_steps': best_eval_steps
+            #                               }
+            #                 torch.save(checkpoint, args.log_directory + '/' + args.model_name + model_save_name)
+            #         eval_summary_writer.flush()
+            #     model.train()
+            #     block_print()
+            #     set_misc(model)
+            #     enable_print()
 
             model_just_loaded = False
             global_step += 1
@@ -550,8 +557,8 @@ def main_worker(gpu, ngpus_per_node, args):
        
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
         writer.close()
-        if args.do_online_eval:
-            eval_summary_writer.close()
+        # if args.do_online_eval:
+        #     eval_summary_writer.close()
 
 def main():
     if args.mode != 'train':
@@ -559,7 +566,7 @@ def main():
         return -1
 
     model_filename = args.model_name + '.py'
-    command = 'mkdir ' + args.log_directory + '/' + args.model_name
+    command = 'mkdir -p ' + args.log_directory + '/' + args.model_name
     os.system(command)
 
     args_out_path = args.log_directory + '/' + args.model_name + '/' + sys.argv[1]
@@ -588,9 +595,9 @@ def main():
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
     ngpus_per_node = torch.cuda.device_count()
-    if ngpus_per_node > 1 and not args.multiprocessing_distributed:
-        print("This machine has more than 1 gpu. Please specify --multiprocessing_distributed, or set \'CUDA_VISIBLE_DEVICES=0\'")
-        return -1
+    # if ngpus_per_node > 1 and not args.multiprocessing_distributed:
+    #     print("This machine has more than 1 gpu. Please specify --multiprocessing_distributed, or set \'CUDA_VISIBLE_DEVICES=0\'")
+    #     return -1
 
     if args.do_online_eval:
         print("You have specified --do_online_eval.")
