@@ -1,0 +1,23 @@
+--mode train
+--model_name bts_season_mask_negative
+--strategy align_with_std
+--mask_negative
+--encoder densenet161_bts
+--dataset kitti
+--data_path /data/dataset/train
+--gt_path /data/dataset/train
+--filenames_file /data/dataset/train/train_list.txt
+--batch_size 4
+--save_freq 2800
+--num_epochs 50
+--learning_rate 1e-4
+--weight_decay 1e-2
+--adam_eps 1e-3
+--num_threads 1
+--input_height 576
+--input_width 768
+--max_depth 80
+--do_random_rotate
+--degree 1.0
+--log_directory ./logs
+--gpu 1

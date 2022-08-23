@@ -113,6 +113,8 @@ parser.add_argument('--garg_crop',                             help='if set, cro
 parser.add_argument('--eval_freq',                 type=int,   help='Online evaluation frequency in global steps', default=500)
 parser.add_argument('--eval_summary_directory',    type=str,   help='output directory for eval summary,'
                                                                     'if empty outputs to checkpoint folder', default='')
+parser.add_argument('--strategy', type=str, help='whether to align with mean or std.', choices=['align_with_mean', 'align_with_std'])
+parser.add_argument('--mask_negative', help='whether to mask negative value, only used in align_with_std.', action='store_true')
 
 if sys.argv.__len__() == 2:
     arg_filename_with_prefix = '@' + sys.argv[1]
@@ -447,17 +449,31 @@ def main_worker(gpu, ngpus_per_node, args):
             depth_gt = torch.autograd.Variable(sample_batched['depth'].cuda(args.gpu, non_blocking=True))
 
             lpg8x8, lpg4x4, lpg2x2, reduc1x1, depth_est = model(image, focal)
-            gt_avg = torch.mean(depth_gt)
-            gt_std = torch.std(depth_gt)
-            est_avg = torch.mean(depth_est)
-            est_std = torch.std(depth_est)
-            depth_est_aligned = (depth_gt - gt_avg) * est_std / gt_std + est_avg
-            depth_est_aligned = torch.where(depth_est_aligned > 1.0, depth_est_aligned, torch.autograd.Variable(torch.tensor(1.0).cuda(args.gpu)))
 
-            if args.dataset == 'nyu':
-                mask = depth_gt > 0.1
+            gt_mask = depth_gt > 0.0
+            if args.strategy == "align_with_mean":
+                gt_avg = torch.mean(depth_gt[gt_mask])
+                est_avg = torch.mean(depth_est[gt_mask])
+                depth_est_aligned = depth_est * gt_avg / est_avg
+            elif args.strategy == "align_with_std":
+                gt_avg = torch.mean(depth_gt[gt_mask])
+                gt_std = torch.std(depth_gt[gt_mask])
+                est_avg = torch.mean(depth_est[gt_mask])
+                est_std = torch.std(depth_est[gt_mask])
+                depth_est_aligned = (depth_gt - gt_avg) * est_std / gt_std + est_avg
+                if not args.mask_negative:
+                    depth_est_aligned = torch.where(depth_est_aligned > 1.0, depth_est_aligned,
+                                                    torch.autograd.Variable(torch.tensor(1.0).cuda(args.gpu)))
             else:
-                mask = depth_gt > 1.0
+                print("strategy not exist!!!")
+                exit(-1)
+
+            # if args.dataset == 'nyu':
+            #     mask = depth_gt > 0.1
+            # else:
+            #     mask = depth_gt > 1.0
+            if args.mask_negative:
+                mask = (depth_gt > 1.0) & (depth_est_aligned > 1.0)
             loss = silog_criterion.forward(depth_est_aligned, depth_gt, mask.to(torch.bool))
             loss.backward()
             for param_group in optimizer.param_groups:
